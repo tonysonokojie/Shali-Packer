@@ -1,0 +1,30 @@
+# Terraform files
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# Packer cache
+packer_cache/
+
+# Log files
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Credentials
+*.pem
+*.key
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Node.js modules
+node_modules/
+
+# Temporary files
+*.tmp
+*.swp

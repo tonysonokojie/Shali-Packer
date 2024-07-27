@@ -1,0 +1,243 @@
+name: Packer CI/CD Workflow
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'feature/*'
+  pull_request:
+    branches:
+      - 'main'
+      - 'feature/*'
+
+jobs:
+  packer-test:
+    runs-on: self-hosted
+    outputs:
+      ami_id: ${{ steps.extract-ami-id.outputs.ami_id}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install unzip
+        run: sudo apt-get install unzip -y
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: '1.8.7'
+
+      - name: Initialize Packer
+        run: packer init .
+
+      - name: Validate Packer template
+        run: packer validate template.pkr.hcl
+
+      - name: Build AMI with Packer
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [[ ${{ github.ref_name }} == 'main' ]]; then
+            packer build -var "ami_tag=production" template.pkr.hcl | tee build.log
+          elif [[ ${{ github.ref_name }} =~ ^feature/ ]]; then
+            packer build -var "ami_tag=testing" template.pkr.hcl | tee build.log
+          else
+            echo "Can't build image in this branch: ${{ github.ref_name }}"
+            exit 1
+          fi
+          ls build.log
+
+      - name: Extract AMI ID from build.log
+        id: extract-ami-id
+        run: |
+          AMI_ID=$(grep -o 'ami-[a-f0-9]\{8,17\}' build.log | tail -n1)
+          echo "Extracted AMI ID: $AMI_ID"
+          if [ -z "$AMI_ID" ]; then
+            echo "AMI ID not found in build log"
+            exit 1
+          fi
+          echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+
+  deploy-to-testing:
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    needs: packer-test
+    runs-on: self-hosted
+    steps:
+      - name: Deploy AMI to testing environment
+        env:
+          AMI_ID: ${{ needs.packer-test.outputs.ami_id }}
+        run: echo "Deploying AMI to testing environment with ID $AMI_ID"
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install unzip
+        run: sudo apt-get install unzip -y
+
+      - name: install or update AWs CLI
+        run: |
+          if command -v aws $> /dev/null; then
+            echo "AWS CLI is already installed. Updating..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install --update
+          else
+            echo "AWS CLI is not found. Installing..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+          fi
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Verify Extracted AMI ID
+        env:
+          AMI_ID: ${{ needs.packer-test.outputs.ami_id }}
+        run: |
+            echo "AMI ID from environment: $AMI_ID"
+            if [[ -z "$AMI_ID" ]];then
+              echo "AMI ID is empty"
+              exit 1
+            fi
+      - name: Deploy AMI to Testing Environment
+        env:
+          AMI_ID: ${{ needs.packer-test.outputs.ami_id }}
+        run: |
+          echo "Deploying AMI to testing environment with ID $AMI_ID"
+          timestamp=$(date '+%Y%m%d%H%M%S%N')
+          LAUNCH_TEMPLATE_NAME="Devops-Pod-B-202407-Testing-$timestamp"
+          echo "{\"ImageId\":\"$AMI_ID\"}" > launch-template.json
+          #create launch Template
+          aws ec2 create-launch-template --launch-template-name $LAUNCH_TEMPLATE_NAME --version-description "v1" --launch-template-data file://launch-template.json --region ${{ env.AWS_REGION }}
+
+      - name: Slack Notification for failures
+        id: slack
+        if: failure() && startsWith(github.ref, 'refs/heads/feature/')
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+            payload: |
+              {
+                "text": "GitHub Action build result: ${{ job.status }}",
+                "blocks": [
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "GitHub Action build failed in repository ${{ github.repository }}\n\nBranch: ${{ github.ref }}\nCommit: ${{ github.sha }}\nFailed Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  }
+                ]
+              }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify team of success
+        if: success()
+        run: echo "Build and deployment to production environment successful for main branch"
+
+  deploy-to-production:
+    if: github.ref == 'refs/heads/main'
+    needs: packer-test
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Deploy AMI to production
+        env:
+          AMI_ID: ${{ needs.packer-test.outputs.ami_id }}
+        run: echo "Deploying AMI to production environment with ID $AMI_ID"
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install unzip
+        run: sudo apt-get install unzip -y
+
+      - name: install or update AWs CLI
+        run: |
+          if command -v aws $> /dev/null; then
+            echo "AWS CLI is already installed. Updating..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install --update
+          else
+            echo "AWS CLI is not found. Installing..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+          fi
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      
+      - name: Verify Extracted AMI ID
+        env:
+          AMI_ID: ${{ needs.packer-test.outputs.ami_id }}
+        run: |
+          echo "AMI ID from environment: $AMI_ID"
+          if [[ -z "$AMI_ID" ]];then
+            echo "AMI ID is empty"
+            exit 1
+          fi
+
+      - name: Manual Approval
+        id: approval
+        if: github.ref_name == 'main'
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: Mitchxxx,uzukwujp
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          minimum-approvals: 1
+          issue-title: "Manual approval required for workflow run"
+          issue-body: |
+            Workflow is pending manual review.
+            URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Required approvers: [Mitchxxx,uzukwujp]
+            Respond "approved", "approve", "lgtm", "yes" to continue workflow or "denied", "deny", "no" to cancel.
+
+      - name: Deploy AMI to Production Environment
+        env:
+          AMI_ID: ${{ needs.packer-test.outputs.ami_id }}
+        run: |
+          echo "Deploying AMI to Production environment with ID $AMI_ID"
+          timestamp=$(date '+%Y%m%d%H%M%S%N')
+          LAUNCH_TEMPLATE_NAME="Devops-Pod-B-202407-Testing-$timestamp"
+          echo "{\"ImageId\":\"$AMI_ID\"}" > launch-template.json
+          #create launch Template
+          aws ec2 create-launch-template --launch-template-name $LAUNCH_TEMPLATE_NAME --version-description "v1" --launch-template-data file://launch-template.json --region ${{ env.AWS_REGION }}
+
+      - name: Slack Notification for failures
+        id: slack
+        if: failure() && github.ref_name == 'main'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "GitHub Action build result: ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "GitHub Action build failed in repository ${{ github.repository }}\n\nBranch: ${{ github.ref }}\nCommit: ${{ github.sha }}\nFailed Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify team of success
+        if: success()
+        run: echo "Build and deployment to production environment successful for main branch"
